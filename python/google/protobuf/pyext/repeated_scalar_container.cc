@@ -666,6 +666,67 @@ static PyObject* MergeFrom(PyObject* pself, PyObject* arg) {
   return Extend(reinterpret_cast<RepeatedScalarContainer*>(pself), arg);
 }
 
+/* This is a terrible workaround for the lower level reflection APIs not
+ * supporting extraction of the data pointer. This I assume is with good reason,
+ * but it does mean - as is the case here - that for large amounts of data
+ * there's a 30x performance tax for working with large repeated fields.
+ *
+ * This *is* not UB, but it's horrible unsafe as it requires the following statements to hold:
+ *   RepeatedFieldRef<T> may not be polymorphic
+ *   The first data member must be RepeatedField<T>*
+ *
+ * The first statement could be validated with static_assert, but the major
+ * danger is the latter requirement, which cannot be portably done.
+ */
+template <typename T>
+  union Bypass {
+  RepeatedFieldRef<T> ref;
+  struct {
+    void* data_;
+  };
+
+  Bypass() : data_( nullptr){}
+};
+
+int GetBuffer(PyObject *exporter, Py_buffer *view, int flags) {
+  RepeatedScalarContainer* self =
+    reinterpret_cast<RepeatedScalarContainer*>(exporter);
+  Message* message = self->parent->message;
+  const Reflection* reflection = message->GetReflection();
+  const FieldDescriptor* field_descriptor = self->parent_field_descriptor;
+
+  void* data = NULL;
+  size_t element_size = 0;
+
+#define GET_BUFFER_GET_DATA(type) {                                                \
+    Bypass<type> temp;                                                  \
+    temp.ref = reflection->GetRepeatedFieldRef<type>(*message, field_descriptor); \
+    data = static_cast< RepeatedField<type>*>(temp.data_)->mutable_data(); \
+    element_size = sizeof(type);                                         \
+  }                                                                     \
+  break
+
+  switch (field_descriptor->cpp_type())
+  {
+    case FieldDescriptor::CPPTYPE_INT32: GET_BUFFER_GET_DATA(int32);
+    case FieldDescriptor::CPPTYPE_INT64: GET_BUFFER_GET_DATA(int64) ;
+    case FieldDescriptor::CPPTYPE_UINT32: GET_BUFFER_GET_DATA(uint32);
+    case FieldDescriptor::CPPTYPE_UINT64: GET_BUFFER_GET_DATA(uint64);
+    case FieldDescriptor::CPPTYPE_FLOAT: GET_BUFFER_GET_DATA(float);
+    case FieldDescriptor::CPPTYPE_DOUBLE: GET_BUFFER_GET_DATA(double);
+    case FieldDescriptor::CPPTYPE_BOOL: GET_BUFFER_GET_DATA(bool);
+    default: {
+      PyErr_Format(PyExc_TypeError,
+                   "cannot convert repeated elements of type '%s' to memory view",
+                   field_descriptor->full_name());
+      return -1;
+    }
+  }
+#undef GET_BUFFER_GET_DATA
+
+  return PyBuffer_FillInfo(view, exporter, data, Len(exporter) * element_size, false, flags);
+}
+
 // The private constructor of RepeatedScalarContainer objects.
 RepeatedScalarContainer* NewContainer(
     CMessage* parent, const FieldDescriptor* parent_field_descriptor) {
@@ -708,6 +769,17 @@ static PyMappingMethods MpMethods = {
   Len,               /* mp_length */
   Subscript,      /* mp_subscript */
   AssSubscript, /* mp_ass_subscript */
+};
+
+/*
+  From https://github.com/python/cpython/blob/master/Objects/memoryobject.c:
+     PyBuffer_Release() decrements view.obj (if non-NULL), so the
+     releasebufferprocs must NOT decrement view.obj. Thus we don't require any
+     specific cleanup in release so we can leave it NULL.
+*/
+static PyBufferProcs BfMethods = {
+    GetBuffer,
+    NULL,
 };
 
 static PyMethodDef Methods[] = {
@@ -753,7 +825,7 @@ PyTypeObject RepeatedScalarContainer_Type = {
   0,                                   //  tp_str
   0,                                   //  tp_getattro
   0,                                   //  tp_setattro
-  0,                                   //  tp_as_buffer
+  &repeated_scalar_container::BfMethods,   //  tp_as_buffer
   Py_TPFLAGS_DEFAULT,                  //  tp_flags
   "A Repeated scalar container",       //  tp_doc
   0,                                   //  tp_traverse
